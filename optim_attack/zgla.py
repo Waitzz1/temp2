@@ -2,26 +2,49 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from zoo import RandomGradientEstimator, RandomGradEstimateMethod
+from utils import make_dir_if_not_exist, setup_seed, progress_bar, show_imgs
 
 
-def stg_algorithm(grad, y, mean_var_list, model, input_size, max_iteration, device):
+def zgla_algorithm(grad, y, mean_var_list, model, input_size, max_iteration, 
+                  device, seed: int, dummy_x = None, is_zoo: bool = False):
     grad = [g.to(device) for g in grad]
     model = model.to(device)
     y = y.to(device)
-    dummy_x = torch.randn(input_size).to(device).requires_grad_(True)
+    if dummy_x is None:
+        dummy_x = torch.randn(input_size).to(device).requires_grad_(True)
+    else:
+        dummy_x = dummy_x.to(device).requires_grad_(True)
 
     hook = BNStatisticsHook(model, train=True)
     optim = torch.optim.Adam([dummy_x], lr=0.1)
-    scheduler = get_warmup_cosine_scheduler(optim, warm_up_iter=50, T_max=20000, lr_max=0.1, lr_min=1e-5)
+    scheduler = get_warmup_cosine_scheduler(optim, warm_up_iter=50, T_max=2000, lr_max=0.1, lr_min=1e-5)
     criterion = nn.CrossEntropyLoss()
+    if is_zoo:
+        zo_estimator = RandomGradientEstimator(
+            parameters=model.parameters(),
+            mu=0.001,
+            num_pert=16,
+            grad_estimate_method=RandomGradEstimateMethod.rge_central,
+            normalize_perturbation=True,
+            device=device,
+            torch_dtype=torch.float32,
+            paramwise_perturb=False,
+        )
 
+    min_total_loss = 1e10
+    min_dummy_x = None
     for iteration in range(max_iteration):
         hook.clear()
         optim.zero_grad()
         model.zero_grad()
-
-        dummy_loss = criterion(model(dummy_x), y)
-        dummy_grad = torch.autograd.grad(dummy_loss, model.parameters(), create_graph=True)
+        
+        if is_zoo:
+            loss_fn = lambda x, y: criterion(model(x), y)
+            dummy_grad = zo_estimator.compute_grad(dummy_x, y, loss_fn, seed=seed)
+        else:
+            dummy_loss = criterion(model(dummy_x), y)
+            dummy_grad = torch.autograd.grad(dummy_loss, model.parameters(), create_graph=True)
         dummy_mean_var_list = hook.mean_var_list
 
         grad_loss = 0
@@ -44,18 +67,22 @@ def stg_algorithm(grad, y, mean_var_list, model, input_size, max_iteration, devi
         cur_lr = optim.state_dict()['param_groups'][0]['lr']
         with torch.no_grad():
             dummy_x += 0.2 * cur_lr * torch.randn(dummy_x.shape).to(device)
-        print(
-            f"\riter:{iteration}, "
-            f"total:{total_loss:.8f}, "
-            f"grad:{grad_loss:.8f}, "
-            f"bn:{bn_loss:.8f}, "
-            f"tv:{tv_loss:.8f}, "
-            f"l2:{l2_loss:.8f}, "
-            f"lr:{cur_lr:.8f}",
-            end="")
+        if total_loss < min_total_loss:
+            min_total_loss = total_loss
+            min_dummy_x = dummy_x.detach().clone()
+        if iteration % 100 == 0:
+            print(
+                f"\riter:{iteration}, "
+                f"total:{total_loss:.8f}, "
+                f"grad:{grad_loss:.8f}, "
+                f"bn:{bn_loss:.8f}, "
+                f"tv:{tv_loss:.8f}, "
+                f"l2:{l2_loss:.8f}, "
+                f"lr:{cur_lr:.8f}",
+                end="")
     print("\nfinish gradient inversion!")
     hook.close()
-    return dummy_x.detach()
+    return min_dummy_x.detach()
 
 
 def tv_loss_fn(x):
